@@ -1,0 +1,144 @@
+# Defaults, safe for a local cluster. values-dev.yaml and values-prod.yaml override them; the pipeline sets
+# image.repository and image.tag (sha-<commit>) with --set-string and never puts secrets into values.
+
+image:
+  repository: docker.io/example/market-maker
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Exactly one Pod, and the Deployment strategy is Recreate (no surge), both fixed in the chart: trading's replacement call
+# checks only the trade sequence, so two bots on one market would both succeed and the last would win. The schema
+# refuses any other count. The bot is stateless, so one Pod loses nothing, and the resting offers keep filling while it
+# is restarted.
+replicaCount: 1
+
+# The health probes (the bot has no other endpoint). The Service below exists only for the release's smoke test.
+service:
+  port: 8080
+
+# Metrics (REQ-20): GET /metrics is served on a port of its own, never on service.port, so that nothing that reaches the
+# probes can read it. The port is rendered as METRICS_PORT and as the container port "metrics"; the Pod annotations
+# prometheus.io/scrape, prometheus.io/port and prometheus.io/path tell Prometheus where to scrape. The Service does not
+# expose it.
+metrics:
+  port: 9464
+
+# Further Pod annotations (the prometheus.io ones come from metrics.port); the pipeline adds checksum/app-env so the Pod restarts when the Secret changes.
+podAnnotations: {}
+
+# The one secret setting (MARKET_MAKER_CLIENT_SECRET, the secret of the Keycloak client market-maker) comes from this
+# Secret as an environment variable. The pipeline creates it from the organization secret MARKET_MAKER_ENV; it is
+# optional so the chart renders without it (the service then refuses to start and says which setting is missing).
+existingSecret: market-maker-env
+
+# Non-secret startup settings, rendered into a ConfigMap (all values are strings). Changing one restarts the Pod,
+# because the environment is read only at start. Every key is described in README.md and bounded by the schema as
+# src/config.ts bounds it. PORT, METRICS_PORT, TRADING_URL and RUNTIME_CONFIG_FILE are rendered by the chart from
+# service.port, metrics.port, trading and the volume mount, and the five runtime keys have their own block below; the schema refuses all of them
+# here, so one value never has two sources. APP_ENV=local (a fake trading client, no NATS) is for a laptop, never a cluster.
+env:
+  APP_ENV: production
+  NATS_URL: nats://nats:4222
+  KEYCLOAK_URL: http://identity:8080
+  KEYCLOAK_REALM: chance
+  MARKET_MAKER_CLIENT_ID: market-maker
+  # The calls to trading: timeout per attempt, retries of a read after the first attempt (a write is never retried),
+  # and the circuit breaker (consecutive failures that open it, milliseconds until one call may try again).
+  TRADING_TIMEOUT_MS: "3000"
+  TRADING_RETRIES: "2"
+  TRADING_CIRCUIT_FAILURES: "5"
+  TRADING_CIRCUIT_HALF_OPEN_MS: "10000"
+  RUNTIME_CONFIG_POLL_MS: "10000"
+  # Drain after SIGTERM: readiness answers 503 and the Pod keeps working for this long before it closes. Nothing routes
+  # requests to the bot, so it does not need to wait; the longest value (15000) still fits into
+  # terminationGracePeriodSeconds (30 in the Deployment) together with the 10 seconds a close may take.
+  SHUTDOWN_DELAY_MS: "0"
+
+# Trading's internal port (the bot's three calls: GET /v1/internal/markets, GET and PUT /v1/internal/markets/{id}/bot-book
+# and bot-orders): TRADING_URL becomes http://<host>:<port>, and the NetworkPolicy opens exactly this port. The internal
+# API sits on its own port because a NetworkPolicy filters by port, not by path (plan section 9); the gateway does not
+# route it. The port has to match trading's service.internalPort.
+trading:
+  host: trading
+  port: 8081
+
+# Runtime configuration (ADR-037): the keys the service applies while it runs, without a restart. They are rendered
+# into the ConfigMap <release>-runtime, which the Pod mounts as the directory /etc/market-maker/runtime (never as a
+# subPath, which would never update). The Pod does NOT restart when it changes: the kubelet refreshes the mounted file
+# within about a minute and the service reads it again every RUNTIME_CONFIG_POLL_MS. A key left out here keeps the
+# service's default; the bounds are checked by the service, which keeps the old value for an invalid one and logs it.
+runtime:
+  LOG_LEVEL: info
+  # The kill switch: "false" stops every call to trading. The offers already resting stay and keep filling. An invalid or
+  # empty value in the mounted runtime file (an edit of the ConfigMap) stops them too: the switch fails closed.
+  QUOTING_ENABLED: "true"
+  # The spread, in microcredits per share (20000 = 0.02 credits): each side's cheapest offer sits half of it above the
+  # reference price, so the cheapest YES and the cheapest NO offer together cost about 1 credit plus this. The minimum,
+  # 20000, is two price steps: it keeps every level at or above the pricing curve, so a pair of shares never costs less
+  # than 1 credit (ADR-057).
+  SPREAD_MICRO: "20000"
+  # Price levels per side: an upper bound. The levels actually quoted are the smaller of this and the limit trading
+  # returns in every book (its runtime MAX_OFFERS_PER_SIDE), so the two charts need no matching deploy. 10 is trading's
+  # default limit. 5 makes a 1000-credit market at 0.50 offer about 107 credits per side (3 offered 63, so a 100-credit
+  # order was refused), and one order walks the price at most five 0.01 steps before the bot quotes again.
+  LEVELS: "5"
+  # How long after the end of one check of all open markets the next one starts (milliseconds, 5 s to 10 min).
+  RECHECK_INTERVAL_MS: "30000"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+# timeoutSeconds: the readiness answer waits for nothing outside the process, but the event loop also runs the message
+# handlers and the check of all open markets, so a busy moment must not make the kubelet mark the Pod not ready (that
+# would stall a rollout and a helm test); readiness gets 4 seconds, startup and liveness the kubelet's default of 1.
+# Keep each below its periodSeconds.
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    timeoutSeconds: 4
+    failureThreshold: 3
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+
+# Admits only the smoke test Pod of the release to the HTTP port (no other client exists), the monitoring namespace to the
+# metrics port only (networkPolicy.metrics.namespace), and lets the Pod reach only what
+# it needs: trading's internal port, NATS, the identity provider (the service token) and DNS. Needs a network policy
+# engine in the cluster (plan section 9). The destinations are Pods of the release's own namespace, selected by the labels
+# below: check them against the trading, NATS and identity Pods before enabling it, because a wrong label blocks the
+# service. Trading's own policy must list market-maker among the callers of its internal port (it does by default).
+networkPolicy:
+  enabled: false
+  # The namespace of Prometheus (selected by its kubernetes.io/metadata.name label): admitted on the metrics port only.
+  metrics:
+    namespace: monitoring
+  egress:
+    trading:
+      podLabels:
+        app.kubernetes.io/name: trading
+    nats:
+      podLabels:
+        app.kubernetes.io/name: nats
+      port: 4222
+    keycloak:
+      podLabels:
+        app.kubernetes.io/name: identity
+      port: 8080
+    dnsNamespaceLabels:
+      kubernetes.io/metadata.name: kube-system
+
+# Smoke test run by "helm test" after every deploy: asks the readiness endpoint through the Service.
+smokeTest:
+  image: docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4

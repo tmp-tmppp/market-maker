@@ -1,0 +1,302 @@
+openapi: 3.1.0
+info:
+  title: trading's internal API as the market maker uses it
+  version: 0.1.0
+  description: |
+    The outgoing contract of the market maker: the three endpoints of trading's internal port it calls (ADR-019,
+    ADR-041), with the fields, statuses and codes it relies on. A subset of trading's
+    `contracts/internal.openapi.yaml` (copy in `contracts/external/trading-internal.openapi.yaml`); the contract tests
+    check that every path, status and schema here is also in trading's file, and that the client parses every body of
+    trading's schemas.
+
+    - Every call carries the bearer token of the identity provider's client-credentials grant of the client
+      `market-maker` (claim `azp`); trading admits that client to these three endpoints only. The service account
+      serves every tenant: trading takes the tenant from the market, never from the token.
+    - **Units** (Proposed ADR-055): microcredits, microshares, prices as microcredits per share on the 0.01 grid
+      (`10000` .. `990000`, multiples of `10000`).
+    - The bot reads its book, computes the whole offer list and replaces it with one PUT that carries the book's
+      `tradeSequence` as `basedOnSequence`. `409 stale_sequence` = a trade happened in between: read again and retry.
+      `409 market_not_open` = stop quoting this market.
+    - Retried by the client (timeout, backoff with jitter, circuit breaker): the two GETs on network errors, timeouts,
+      408, 429 and 5xx. The PUT is sent once per attempt of a quote run, never repeated blindly: its outcome may depend
+      on a newer book.
+servers:
+  - url: http://trading:8081
+    description: trading's internal Kubernetes service port (a local trading listens on 8091)
+security:
+  - serviceToken: []
+
+paths:
+  /v1/internal/markets:
+    get:
+      operationId: listOpenMarkets
+      summary: Open markets of every tenant, by tenant id then market id (the start and the periodic check)
+      parameters:
+        - name: status
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [open]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        '200':
+          description: One page; `nextCursor` null on the last one
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotMarketPage'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Problem'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/markets/{marketId}/bot-book:
+    get:
+      operationId: getBotBook
+      summary: The bot account's holdings, its resting offers, the market's trade sequence and the offer limit per side
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      responses:
+        '200':
+          description: The book
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotBook'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Problem'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/markets/{marketId}/bot-orders:
+    put:
+      operationId: replaceBotOrders
+      summary: Replace all of the bot's offers of the market in one transaction
+      description: |
+        Accepted while trading's copy is `funded` or `open` (offers on a funded copy rest until the market opens).
+        Per side the offers may not exceed the holding plus the credits (`409 insufficient_holdings`); prices off the
+        grid, a repeated price per side, more than trading's `MAX_OFFERS_PER_SIDE` per side (the book's
+        `maxOffersPerSide`), or a cheapest YES plus cheapest NO below 1 credit (`crossed_offers`) are `400`. An empty
+        list cancels every offer.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceBotOrdersRequest'
+      responses:
+        '200':
+          description: The new book
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotBook'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Problem'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          description: |
+            `stale_sequence` (with the current `tradeSequence`): read again and retry. `market_not_open`: stop quoting.
+            `insufficient_holdings`: a defect (the bot checks backing before it sends).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Client-credentials access token of the client `market-maker` (claim `azp`)
+
+  parameters:
+    MarketId:
+      name: marketId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Problem:
+      description: RFC 9457 problem details with a stable `code`
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: Not definitive; the client treats it as trading being unavailable and tries again later
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Side:
+      type: string
+      enum: ['YES', 'NO']
+    BotMarket:
+      type: object
+      required: [marketId, tenantId, status, version, closeTime, startingPriceMicro, fundingMicro, tradeSequence]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [funded, open, closed, resolved]
+        version:
+          type: integer
+          minimum: 0
+        closeTime:
+          type: ['string', 'null']
+          format: date-time
+        startingPriceMicro:
+          type: ['integer', 'null']
+          minimum: 10000
+          maximum: 990000
+          description: Null until trading has processed MarketOpened; the bot does not quote without it
+        fundingMicro:
+          type: ['integer', 'null']
+          minimum: 1
+          description: Null until the funding call; with the starting price it fixes the held-back shares
+        tradeSequence:
+          type: integer
+          minimum: 0
+    BotMarketPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BotMarket'
+        nextCursor:
+          type: ['string', 'null']
+    Offer:
+      type: object
+      additionalProperties: false
+      required: [side, priceMicro, sharesMicro]
+      properties:
+        side:
+          $ref: '#/components/schemas/Side'
+        priceMicro:
+          type: integer
+          minimum: 10000
+          maximum: 990000
+          multipleOf: 10000
+        sharesMicro:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+    BotBook:
+      type: object
+      required: [market, holdings, offers, tradeSequence, offersPricedOnSequence, maxOffersPerSide]
+      properties:
+        market:
+          $ref: '#/components/schemas/BotMarket'
+        holdings:
+          type: object
+          required: [balanceMicro, yesMicro, noMicro]
+          properties:
+            balanceMicro:
+              type: integer
+              minimum: 0
+            yesMicro:
+              type: integer
+              minimum: 0
+            noMicro:
+              type: integer
+              minimum: 0
+        offers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Offer'
+        tradeSequence:
+          type: integer
+          minimum: 0
+          description: Sent as `basedOnSequence` of the next PUT
+        offersPricedOnSequence:
+          type: ['integer', 'null']
+          minimum: 0
+          description: Information only; never sent as `basedOnSequence`
+        maxOffersPerSide:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: |
+            The most offers per side trading accepts now (its runtime `MAX_OFFERS_PER_SIDE`, read with every book). The
+            bot quotes at most min(`LEVELS`, this) levels per side.
+    ReplaceBotOrdersRequest:
+      type: object
+      additionalProperties: false
+      required: [basedOnSequence, offers]
+      properties:
+        basedOnSequence:
+          type: integer
+          minimum: 0
+        offers:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Offer'
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          examples: [stale_sequence, market_not_open, insufficient_holdings, crossed_offers, validation_failed, not_found, forbidden]
+        tradeSequence:
+          type: integer
+          minimum: 0

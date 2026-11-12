@@ -1,0 +1,7 @@
+apiVersion: v2
+name: market-maker
+description: The market-maker bot of Chance, a stateless service that quotes YES and NO offers on every open market through trading's internal API.
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

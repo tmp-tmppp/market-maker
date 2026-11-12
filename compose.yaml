@@ -1,0 +1,52 @@
+# Local run of the market-maker service: NATS with JetStream and the bot itself.
+#   docker compose up --build
+#   curl http://localhost:8090/health/ready
+# The bot is published on host port 8090: trading's own compose file publishes its public API on 8080, so the two can
+# run side by side.
+# The bot starts with APP_ENV=local: trading is replaced by an in-memory client with one open demo market, which the
+# bot quotes on start and every RECHECK_INTERVAL_MS (watch the log: docker compose logs -f market-maker). The streams
+# MARKETS and TRADING do not exist until the markets and trading services have published to this NATS, so until then the
+# bot logs that they are missing and retries; readiness still answers 200 and reports broker "disconnected".
+#
+# Against a real trading service on this machine, add these to the environment of market-maker (and start trading,
+# markets and the identity provider against the same NATS). The first one makes the container reach the host, where a
+# local trading publishes its internal port (8081 in the cluster) on 8091 and a local identity provider publishes
+# Keycloak on 8081:
+#   extra_hosts: ["host.docker.internal:host-gateway"]
+#   TRADING_URL: http://host.docker.internal:8091
+#   KEYCLOAK_URL: http://host.docker.internal:8081
+#   KEYCLOAK_REALM: chance
+#   and MARKET_MAKER_CLIENT_SECRET, the secret of the Keycloak client market-maker, passed from your own shell
+#   (`MARKET_MAKER_CLIENT_SECRET: ${MARKET_MAKER_CLIENT_SECRET}`) and never written into this file.
+#
+# Without Docker for the bot: docker compose up -d nats, then npm run build and
+#   APP_ENV=local NATS_URL=nats://localhost:4222 npm start
+name: chance-market-maker
+
+services:
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+  market-maker:
+    build: .
+    depends_on:
+      - nats
+    environment:
+      APP_ENV: local
+      NATS_URL: nats://nats:4222
+      PORT: "8080"
+      # The shortest check interval (default 30 seconds), so the demo shows activity quickly.
+      RECHECK_INTERVAL_MS: "5000"
+    ports:
+      - "127.0.0.1:8090:8080"
+      # GET /metrics (METRICS_PORT, default 9464): curl http://localhost:9464/metrics
+      - "127.0.0.1:9464:9464"
+
+volumes:
+  nats-data:

@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values of the market-maker chart",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "replicaCount", "service", "metrics", "existingSecret", "env", "trading", "runtime", "resources", "probes", "networkPolicy", "smokeTest"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "const": 1,
+      "description": "Always one Pod: trading's replacement call checks only the trade sequence, which a replacement does not change, so two writers on one market both succeed and the last one wins, each pricing with its own settings or code."
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "GET /metrics is served on this port, never on service.port (the template refuses equal ports).",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "The prometheus.io/* annotations are set by the chart from metrics.port; they cannot be set here.",
+      "propertyNames": { "not": { "pattern": "^prometheus\\.io/" } },
+      "additionalProperties": { "type": "string" }
+    },
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "env": {
+      "type": "object",
+      "description": "Non-secret startup settings only, each bounded as src/config.ts bounds it; an unknown key is refused. The client secret belongs in the Secret named by existingSecret; PORT, METRICS_PORT, TRADING_URL and RUNTIME_CONFIG_FILE are rendered by the chart; the five runtime keys have their own block. APP_ENV=local (a fake trading client, no NATS) is never allowed in a cluster.",
+      "additionalProperties": false,
+      "properties": {
+        "APP_ENV": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "not": { "enum": ["local"] }, "description": "Lowercase letters, digits and dashes; not local" },
+        "NATS_URL": { "type": "string", "pattern": "^(nats|tls)://[^@/\\s]+$", "description": "nats:// or tls://, without a user name or password" },
+        "KEYCLOAK_URL": { "type": "string", "pattern": "^https?://[^@\\s]+$", "description": "http(s)://, without a user name or password" },
+        "KEYCLOAK_REALM": { "type": "string", "minLength": 1 },
+        "MARKET_MAKER_CLIENT_ID": { "type": "string", "minLength": 1 },
+        "TRADING_TIMEOUT_MS": { "type": "string", "pattern": "^(1[0-9]{2}|[2-9][0-9]{2}|[1-9][0-9]{3}|[1-5][0-9]{4}|60000)$", "description": "100 to 60000, as src/config.ts accepts" },
+        "TRADING_RETRIES": { "type": "string", "pattern": "^([0-9]|10)$", "description": "0 to 10" },
+        "TRADING_CIRCUIT_FAILURES": { "type": "string", "pattern": "^([1-9][0-9]?|100)$", "description": "1 to 100" },
+        "TRADING_CIRCUIT_HALF_OPEN_MS": { "type": "string", "pattern": "^([1-9][0-9]{3,4}|[1-5][0-9]{5}|600000)$", "description": "1000 to 600000" },
+        "RUNTIME_CONFIG_POLL_MS": { "type": "string", "pattern": "^([1-9][0-9]{3,5}|[12][0-9]{6}|3[0-5][0-9]{5}|3600000)$", "description": "1000 to 3600000" },
+        "SHUTDOWN_DELAY_MS": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,3}|1[0-4][0-9]{3}|15000)$", "description": "0 to 15000, so the delay plus the 10 s a close may take fits into terminationGracePeriodSeconds (30)" }
+      }
+    },
+    "trading": {
+      "type": "object",
+      "description": "Trading's internal port: TRADING_URL is http://host:port and the NetworkPolicy opens this port. It has to be trading's service.internalPort.",
+      "additionalProperties": false,
+      "required": ["host", "port"],
+      "properties": {
+        "host": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "The keys the service applies while it runs (ADR-037); rendered into the ConfigMap <release>-runtime, whose change does not restart the Pod. Values are strings, bounded as src/config.ts bounds them.",
+      "additionalProperties": false,
+      "properties": {
+        "LOG_LEVEL": { "type": "string", "enum": ["fatal", "error", "warn", "info", "debug", "trace", "silent"] },
+        "QUOTING_ENABLED": { "type": "string", "enum": ["true", "false"], "description": "The kill switch: false stops every call to trading; resting offers stay and keep filling. An invalid or empty value edited into the runtime ConfigMap also stops them (fails closed)" },
+        "SPREAD_MICRO": { "type": "string", "pattern": "^(2[0-9]{4}|[3-9][0-9]{4}|1[0-9]{5}|200000)$", "description": "20000 to 200000 microcredits per share; the minimum (two price steps) keeps every level at or above the pricing curve" },
+        "LEVELS": { "type": "string", "pattern": "^([1-9]|10)$", "description": "1 to 10: an upper bound; the levels quoted are the smaller of this and the maxOffersPerSide in trading's book" },
+        "RECHECK_INTERVAL_MS": { "type": "string", "pattern": "^([5-9][0-9]{3}|[1-9][0-9]{4}|[1-5][0-9]{5}|600000)$", "description": "5000 to 600000" }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "metrics": {
+          "type": "object",
+          "description": "The namespace of Prometheus, admitted on the metrics port only.",
+          "additionalProperties": false,
+          "required": ["namespace"],
+          "properties": { "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" } }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["trading", "nats", "keycloak", "dnsNamespaceLabels"],
+          "properties": {
+            "trading": { "$ref": "#/definitions/destination" },
+            "nats": { "$ref": "#/definitions/destinationWithPort" },
+            "keycloak": { "$ref": "#/definitions/destinationWithPort" },
+            "dnsNamespaceLabels": { "$ref": "#/definitions/labels" }
+          }
+        }
+      }
+    },
+    "smokeTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": { "image": { "type": "string", "minLength": 1 } }
+    }
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Keep it below periodSeconds. The kubelet default is 1." },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" }
+    },
+    "destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podLabels"],
+      "properties": { "podLabels": { "$ref": "#/definitions/labels" } }
+    },
+    "destinationWithPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podLabels", "port"],
+      "properties": {
+        "podLabels": { "$ref": "#/definitions/labels" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    }
+  }
+}

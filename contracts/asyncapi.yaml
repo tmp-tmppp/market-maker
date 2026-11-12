@@ -1,0 +1,163 @@
+asyncapi: 3.0.0
+info:
+  title: Chance market-maker events
+  version: 0.1.0
+  description: |
+    The events the market maker consumes from NATS JetStream. It publishes none (plan 6.4).
+
+    - Format: CloudEvents 1.0, structured JSON mode; the message body is the whole CloudEvent. The full schemas are
+      the publishers' (markets' and trading's `contracts/asyncapi.yaml`, copies in `contracts/external/`).
+    - **Event notification (EP-1, ADR-041).** The bot reads only CloudEvent attributes: `type`, `id`, `time`,
+      `tenantid`, `correlationid` and the market from `subject` (`market/<marketId>`). It reads no business field of
+      `data`; the single exception is TradeExecuted's `data.tradeSequence`, which it logs and never decides on. Every
+      reaction reads the bot's book from trading again (GET bot-book) and replaces the offers with one PUT.
+    - Two durable pull consumers named `market-maker`: stream `MARKETS` with the filters
+      `chance.markets.MarketOpened.*`, `chance.markets.MarketClosed.*` and `chance.markets.MarketResolved.*`, and
+      stream `TRADING` with `chance.trading.TradeExecuted.*`. Deliver policy `new` when the durable is created; an
+      existing durable resumes where it stopped, so after an outage an event whose `time` is more than 60 s older than
+      the process start is acknowledged without a call (the start-up check reads every open book after it). Explicit
+      acks after the quote run, one message per pull (only the message in hand is kept alive), ack wait 30 s extended
+      while a run lasts, max ack pending 10, max deliver unlimited. A run that trading has not made possible yet
+      (`not_ready`) or that failed is nak'd with a delay of 5 s; a run that met only stale sequences is acknowledged
+      (each of those trades publishes its own TradeExecuted). After 5 deliveries a failing event is logged as an error
+      and acknowledged (the periodic check quotes the market again within `RECHECK_INTERVAL_MS`). A malformed event or
+      another type is logged and acknowledged.
+    - No inbox: the reaction is idempotent by construction. A repeated or late event leads to one more read of the book
+      and, at most, one replacement priced on the current trade sequence; a replacement with the same offers is not
+      even sent.
+defaultContentType: application/json
+servers:
+  nats:
+    host: nats:4222
+    protocol: nats
+    description: NATS server with JetStream, reached by its Kubernetes service name (localhost:4222 in local runs)
+
+channels:
+  marketOpened:
+    address: chance.markets.MarketOpened.{tenantId}
+    description: A market was funded and opened; the bot reads its book and places its first offers (FL-A steps 3-4)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MarketOpened:
+        $ref: '#/components/messages/MarketOpened'
+  marketClosed:
+    address: chance.markets.MarketClosed.{tenantId}
+    description: A market was closed; the bot stops quoting it (trading cancels the offers itself)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MarketClosed:
+        $ref: '#/components/messages/MarketClosed'
+  marketResolved:
+    address: chance.markets.MarketResolved.{tenantId}
+    description: A market was resolved; the bot stops quoting it (trading settles it and returns the holdings to the creator)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MarketResolved:
+        $ref: '#/components/messages/MarketResolved'
+  tradeExecuted:
+    address: chance.trading.TradeExecuted.{tenantId}
+    description: A trader bought from the bot's offers; the bot reads its book and re-prices (FL-A step 7)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      TradeExecuted:
+        $ref: '#/components/messages/TradeExecuted'
+
+operations:
+  receiveMarketOpened:
+    action: receive
+    channel:
+      $ref: '#/channels/marketOpened'
+    summary: Quote the market (a notification; the book is read from trading)
+  receiveMarketClosed:
+    action: receive
+    channel:
+      $ref: '#/channels/marketClosed'
+    summary: Stop quoting; no call is made
+  receiveMarketResolved:
+    action: receive
+    channel:
+      $ref: '#/channels/marketResolved'
+    summary: Stop quoting; no call is made
+  receiveTradeExecuted:
+    action: receive
+    channel:
+      $ref: '#/channels/tradeExecuted'
+    summary: Re-price the market (a notification; the book is read from trading)
+
+components:
+  messages:
+    MarketOpened:
+      name: MarketOpened
+      title: Market opened (published by markets; consumed as a notification)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Notification'
+    MarketClosed:
+      name: MarketClosed
+      title: Market closed (published by markets)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Notification'
+    MarketResolved:
+      name: MarketResolved
+      title: Market resolved (published by markets)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Notification'
+    TradeExecuted:
+      name: TradeExecuted
+      title: Trade executed (published by trading; consumed as a notification)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TradeNotification'
+
+  schemas:
+    Notification:
+      type: object
+      description: The attributes the bot reads; every other attribute and all of `data` are ignored
+      required: [specversion, id, type, subject, tenantid]
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - si.chance.markets.MarketOpened.v1
+            - si.chance.markets.MarketClosed.v1
+            - si.chance.markets.MarketResolved.v1
+            - si.chance.trading.TradeExecuted.v1
+        subject:
+          type: string
+          pattern: '^market/[0-9a-fA-F-]{36}$'
+          description: '`market/<marketId>`: the market to quote'
+        tenantid:
+          type: string
+          format: uuid
+          description: Logged only; trading takes the tenant from the market
+        correlationid:
+          type: string
+          description: Sent on to trading as X-Correlation-Id; the event id when missing
+    TradeNotification:
+      allOf:
+        - $ref: '#/components/schemas/Notification'
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                tradeSequence:
+                  type: integer
+                  minimum: 1
+                  description: Logged only; the bot prices on the trade sequence of the book it reads

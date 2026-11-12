@@ -1,0 +1,42 @@
+# "helm test" after every deploy: the readiness endpoint answers through the Service. It answers 200 unless the bot is
+# shutting down; it deliberately checks neither NATS nor trading (their outage must not take the bot out, and a stream
+# that does not exist yet must not fail a deploy), so a passing test means the process is up and serving. A failure
+# makes the pipeline roll the release back (ADR-048).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "market-maker.fullname" . }}-smoke-test
+  labels:
+    {{- include "market-maker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: smoke-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: smoke-test
+      image: {{ .Values.smokeTest.image }}
+      command:
+        - wget
+        - -q
+        - -T
+        - "5"
+        - -O
+        - "-"
+        - "http://{{ include "market-maker.fullname" . }}:{{ .Values.service.port }}{{ .Values.probes.readiness.path }}"
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      securityContext:
+        {{- include "market-maker.containerSecurityContext" . | nindent 8 }}

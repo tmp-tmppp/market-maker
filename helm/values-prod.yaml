@@ -1,0 +1,22 @@
+# Prod overrides. The pipeline sets the image tag; the secret setting comes from the Secret market-maker-env
+# (MARKET_MAKER_ENV).
+replicaCount: 1
+
+env:
+  APP_ENV: production
+
+# The pricing and check settings written out, so a change is a reviewed line of this file (or an edit of the ConfigMap
+# <release>-runtime, which applies within about a minute without a restart).
+runtime:
+  LOG_LEVEL: info
+  QUOTING_ENABLED: "true"
+  SPREAD_MICRO: "20000"
+  LEVELS: "5"
+  RECHECK_INTERVAL_MS: "30000"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi

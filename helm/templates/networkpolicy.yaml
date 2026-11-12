@@ -1,0 +1,75 @@
+{{- if .Values.networkPolicy.enabled }}
+# Ingress: only the smoke test Pod of this release may reach the HTTP port (the bot has no other client; the gateway does
+# not route to it, and the kubelet probes come from the node, which network policy engines let through), and only the
+# monitoring namespace may reach the metrics port.
+# Egress: trading's internal port, NATS, the identity provider (the service token) and DNS; everything else is denied
+# (plan section 9). The policy selects the bot's Pod only, not the smoke test Pod, which carries the same selector
+# labels but must reach the Service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "market-maker.fullname" . }}
+  labels:
+    {{- include "market-maker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "market-maker.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["smoke-test"]
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: smoke-test
+      ports:
+        - port: http
+          protocol: TCP
+    # Prometheus scrapes the metrics port; no other namespace may reach it.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.metrics.namespace | quote }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    # Trading: only its internal port (bot-book, bot-orders, the list of open markets).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.trading.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.trading.port }}
+          protocol: TCP
+    # NATS: the two durable consumers (streams MARKETS and TRADING).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.nats.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.nats.port }}
+          protocol: TCP
+    # The identity provider: the client-credentials token for trading's internal API.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.keycloak.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.keycloak.port }}
+          protocol: TCP
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.dnsNamespaceLabels | nindent 14 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}

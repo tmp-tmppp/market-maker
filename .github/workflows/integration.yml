@@ -1,0 +1,35 @@
+# The integration tests of the market maker: its JetStream consumers against a real NATS server with JetStream
+# (Testcontainers, so the runner's Docker daemon): the durable consumers are created with the spec's settings, a
+# deleted consumer or stream is created again, an event is acknowledged only after its quote run, and a failing one is
+# given up after GIVE_UP_AFTER_DELIVERIES deliveries. The shared workflow of ci-cd.yml runs lint, type check and the
+# unit tests with coverage, and the coverage gate leaves out the NATS connection loop, so this is its only check.
+# Make "integration / integration" a required check of the pull request.
+name: integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run test:integration

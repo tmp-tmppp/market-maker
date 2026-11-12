@@ -1,0 +1,19 @@
+# The bot receives no requests: nothing routes to it and the gateway does not know it. This Service exists only so that
+# the smoke test of the release (helm test) can reach the readiness endpoint by name; the kubelet probes go to the Pod.
+# The named targetPort keeps the smoke test Pod, which carries the same selector labels but no port "http", out of the
+# endpoints.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "market-maker.fullname" . }}
+  labels:
+    {{- include "market-maker.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "market-maker.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
